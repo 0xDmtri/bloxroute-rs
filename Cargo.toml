@@ -1,0 +1,28 @@
+[package]
+name = "bloxroute-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Async bloXroute WebSocket transaction submission for Ethereum, BNB Smart Chain, Base, and Robinhood Chain"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/0xDmtri/bloxroute-rs"
+keywords = ["bloxroute", "ethereum", "evm", "websocket", "transactions"]
+categories = ["api-bindings", "asynchronous", "network-programming"]
+include = ["src/**", "examples/**", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
+ahash = "0.8"
+alloy-primitives = { version = "1.7", default-features = false, features = ["asm-keccak"] }
+faster-hex = "1.0"
+futures-util = { version = "0.3", features = ["sink"] }
+hashbrown = "0.17"
+itoa = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tracing = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "test-util"] }
