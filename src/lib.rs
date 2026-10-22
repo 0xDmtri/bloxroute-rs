@@ -5,5 +5,8 @@
 pub mod client;
 pub mod network;
 
-pub use client::{BloxrouteClient, BloxrouteClientError, BloxrouteOptions};
+pub use client::{
+    BloxrouteClient, BloxrouteClientError, BloxrouteOptions, Submission, SubmissionOutcome,
+    SubmissionTiming,
+};
 pub use network::BloxrouteNetwork;

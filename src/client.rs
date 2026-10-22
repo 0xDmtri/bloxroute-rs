@@ -3,10 +3,10 @@
 use std::{
     fmt,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant as Timestamp},
 };
 
 use alloy_primitives::{Address, B256, keccak256};
@@ -15,15 +15,16 @@ use serde::Deserialize;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
     task::AbortHandle,
-    time::{Instant, MissedTickBehavior, interval, timeout, timeout_at},
+    time::{Instant, MissedTickBehavior, interval, sleep, timeout, timeout_at},
 };
 use tokio_tungstenite::{
     WebSocketStream, connect_async_with_config,
     tungstenite::{
         Message,
         client::IntoClientRequest,
+        handshake::client::Request as Handshake,
         http::{HeaderValue, header::AUTHORIZATION},
         protocol::WebSocketConfig,
     },
@@ -33,15 +34,24 @@ use crate::network::BloxrouteNetwork;
 
 type FastMap<K, V> = hashbrown::HashMap<K, V, std::hash::BuildHasherDefault<ahash::AHasher>>;
 
+const RECONNECT_MIN: Duration = Duration::from_millis(100);
+const RECONNECT_MAX: Duration = Duration::from_secs(1);
+
 /// Submission, connection, and configuration failures.
 ///
-/// Use [`Self::may_have_been_submitted`] when deciding whether a transaction's
-/// delivery needs reconciliation before retrying.
+/// Use [`Self::may_have_been_submitted`] to decide whether delivery needs
+/// reconciliation before retrying.
 #[derive(Debug, Error)]
 pub enum BloxrouteClientError {
     /// WebSocket setup failed before a submission write was attempted.
     #[error("ws connection failed: {0}")]
     Connect(#[from] tokio_tungstenite::tungstenite::Error),
+    /// No established connection is available for immediate submission.
+    #[error("submission connection is not ready")]
+    NotConnected,
+    /// All submission slots are occupied; nothing was enqueued.
+    #[error("submission capacity is full")]
+    Full,
     /// The connection closed before a submission write was attempted.
     #[error("connection closed before submission")]
     Closed,
@@ -53,7 +63,7 @@ pub enum BloxrouteClientError {
     Rpc {
         /// Error code returned by the API.
         code: i64,
-        /// Error message returned by the API.
+        /// Description supplied by the API.
         message: String,
     },
     /// An API response did not contain a valid 32-byte transaction hash.
@@ -65,7 +75,7 @@ pub enum BloxrouteClientError {
     /// A write was attempted, but a matching acknowledgement was not received.
     #[error("acknowledgement unknown for {tx_hash}: {reason}")]
     AcknowledgementUnknown {
-        /// Hash computed from the submitted transaction bytes.
+        /// The submitted transaction's local hash.
         tx_hash: B256,
         /// Description of the acknowledgement failure.
         reason: &'static str,
@@ -79,7 +89,7 @@ pub enum BloxrouteClientError {
     /// The signed transaction exceeded the encoded request budget.
     #[error("transaction request exceeds {limit} bytes")]
     RequestTooLarge {
-        /// Configured request budget in bytes, including JSON and hex encoding.
+        /// Configured request budget, including JSON and hex encoding.
         limit: usize,
     },
     /// The selected route does not support a BackRunMe reward address.
@@ -92,15 +102,13 @@ pub enum BloxrouteClientError {
 
 impl BloxrouteClientError {
     /// Whether delivery remains uncertain after a submission failure.
-    ///
-    /// [`BloxrouteClient::send_raw_tx`] reports transport failures after a write
-    /// attempt as [`Self::AcknowledgementUnknown`]. Invalid responses also leave
-    /// delivery uncertain.
     #[must_use]
     pub fn may_have_been_submitted(&self) -> bool {
         match self {
             Self::AcknowledgementUnknown { .. } | Self::Json(_) | Self::MissingHash => true,
             Self::Connect(_)
+            | Self::NotConnected
+            | Self::Full
             | Self::Closed
             | Self::Rpc { .. }
             | Self::Timeout
@@ -112,30 +120,23 @@ impl BloxrouteClientError {
     }
 }
 
-/// Deadlines, connection keepalives, and per-client resource limits.
-///
-/// All submission work, including queueing and connection setup, shares the
-/// [`Self::request_timeout`] deadline. Limits are validated by
-/// [`BloxrouteClient::with_options`].
+/// Deadlines, keepalives, and per-client resource limits.
 #[derive(Debug, Clone, Copy)]
 pub struct BloxrouteOptions {
-    /// Connection setup deadline, including queueing for [`BloxrouteClient::connect`].
-    /// Defaults to 5 seconds.
+    /// Deadline for connection warmup and each background handshake. Defaults to 5 s.
     pub connect_timeout: Duration,
-    /// Whole submission deadline, including admission, connection, write, and acknowledgement.
-    /// Defaults to 5 seconds.
+    /// Submission deadline, including admission, write, and acknowledgement. Defaults to 5 s.
+    /// [`BloxrouteClient::send_raw_tx`] also includes waiting for connection readiness.
     pub request_timeout: Duration,
-    /// Deadline for each WebSocket write, also bounded by the submission deadline.
-    /// Defaults to 1 second.
+    /// Deadline for each WebSocket write, bounded by the submission deadline. Defaults to 1 s.
     pub write_timeout: Duration,
-    /// Interval between keepalive pings. Defaults to 15 seconds.
+    /// Interval between keepalive pings. Defaults to 15 s.
     pub ping_interval: Duration,
-    /// Deadline for a keepalive pong after a ping. Defaults to 5 seconds.
+    /// Deadline for a keepalive pong. Defaults to 5 s.
     pub pong_timeout: Duration,
     /// Maximum admitted submissions awaiting completion. Defaults to 64.
     pub max_in_flight: usize,
-    /// Encoded request budget, including JSON and hexadecimal expansion.
-    /// Defaults to 2 MiB; must be at least 256 bytes.
+    /// Encoded request budget, including JSON and hex expansion. Defaults to 2 MiB.
     pub max_request_bytes: usize,
     /// Maximum incoming WebSocket message or frame size. Defaults to 64 KiB.
     pub max_response_bytes: usize,
@@ -156,16 +157,95 @@ impl Default for BloxrouteOptions {
     }
 }
 
-/// Persistent WebSocket submission client for one explicitly selected network.
+/// Monotonic timestamps recorded at admission and inside the socket driver.
 ///
-/// Reuse a client across submissions and share it with [`Arc`] across tasks.
-/// Methods that connect or submit must run within a Tokio runtime with I/O and
-/// time enabled. A later submission reconnects after a closed connection.
+/// Write completion means the WebSocket sink was flushed to the underlying
+/// transport. It does not prove delivery to the remote server or chain inclusion.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmissionTiming {
+    /// Immediately before the request is handed to the driver, after encoding.
+    pub enqueued_at: Timestamp,
+    /// Immediately before attempting the WebSocket write.
+    pub write_started_at: Option<Timestamp>,
+    /// After the WebSocket write and flush completed successfully.
+    pub write_completed_at: Option<Timestamp>,
+    /// When the driver received the matching API response, including rejection.
+    pub response_received_at: Option<Timestamp>,
+}
+
+/// A submission's acknowledgement or failure, including transport timing.
+#[derive(Debug)]
+pub struct SubmissionOutcome {
+    /// The locally supplied or computed transaction hash.
+    pub tx_hash: B256,
+    /// Success means the server acknowledged this hash; inclusion is separate.
+    pub result: Result<(), BloxrouteClientError>,
+    /// Driver timestamps, retained on failures as well as success.
+    pub timing: SubmissionTiming,
+}
+
+/// Observe a request already enqueued by [`BloxrouteClient::try_submit`].
+///
+/// Sending and driver deadlines progress without calling [`Self::wait`]. Keep
+/// this handle alive: dropping it cancels a request only if writing has not
+/// started. Cancellation after a write cannot establish non-delivery.
+#[must_use = "keep the submission alive until its outcome is known"]
+#[derive(Debug)]
+pub struct Submission {
+    deadline: Instant,
+    response: oneshot::Receiver<SubmissionOutcome>,
+    cancellation: CancelQueued,
+}
+
+impl Submission {
+    /// The locally supplied or computed transaction hash.
+    pub fn tx_hash(&self) -> B256 {
+        self.cancellation.state.tx_hash
+    }
+
+    /// Wait for the outcome within the original submission deadline.
+    ///
+    /// The local deadline also covers a driver currently blocked on another
+    /// socket write. Timing records whatever the driver had observed at return.
+    pub async fn wait(self) -> SubmissionOutcome {
+        let state = &self.cancellation.state;
+
+        match timeout_at(self.deadline, self.response).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => state.outcome(Err(state.delivery_error()), None),
+            Err(_) => {
+                let previous = state.phase.compare_exchange(
+                    QUEUED,
+                    CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                let error = if matches!(previous, Err(WRITING)) {
+                    BloxrouteClientError::AcknowledgementUnknown {
+                        tx_hash: state.tx_hash,
+                        reason: "submission deadline elapsed",
+                    }
+                } else {
+                    BloxrouteClientError::Timeout
+                };
+
+                state.outcome(Err(error), None)
+            }
+        }
+    }
+}
+
+/// One persistent WebSocket driver for one explicitly selected network.
+///
+/// Construction performs no I/O. [`Self::connect`] starts the driver on the
+/// calling Tokio runtime and waits for readiness. The driver then reconnects
+/// independently until the client is dropped. Use a multi-thread runtime when
+/// the submitting thread performs synchronous computation.
 pub struct BloxrouteClient {
     network: BloxrouteNetwork,
     endpoint: String,
     auth_header: String,
-    connection: Mutex<Option<Arc<Connection>>>,
+    driver: OnceLock<Driver>,
     slots: Arc<Semaphore>,
     id: AtomicU64,
     options: BloxrouteOptions,
@@ -181,13 +261,16 @@ impl fmt::Debug for BloxrouteClient {
     }
 }
 
-struct Connection {
-    requests: mpsc::Sender<Submission>,
+struct Driver {
+    requests: mpsc::Sender<QueuedSubmission>,
+    generation: Arc<AtomicU64>,
+    readiness: watch::Receiver<()>,
     task: AbortHandle,
 }
 
-impl Drop for Connection {
+impl Drop for Driver {
     fn drop(&mut self) {
+        self.generation.store(0, Ordering::Release);
         self.task.abort();
     }
 }
@@ -196,38 +279,116 @@ const QUEUED: u8 = 0;
 const WRITING: u8 = 1;
 const CANCELLED: u8 = 2;
 
-struct CancelQueued(Arc<AtomicU8>);
+#[derive(Debug)]
+struct SubmissionState {
+    tx_hash: B256,
+    enqueued_at: Timestamp,
+    phase: AtomicU8,
+    write_started_at: OnceLock<Timestamp>,
+    write_completed_at: OnceLock<Timestamp>,
+}
 
-impl Drop for CancelQueued {
-    fn drop(&mut self) {
-        let _ = self
-            .0
-            .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+impl SubmissionState {
+    fn new(tx_hash: B256) -> Self {
+        Self {
+            tx_hash,
+            enqueued_at: Instant::now().into_std(),
+            phase: AtomicU8::new(QUEUED),
+            write_started_at: OnceLock::new(),
+            write_completed_at: OnceLock::new(),
+        }
+    }
+
+    fn delivery_error(&self) -> BloxrouteClientError {
+        if self.phase.load(Ordering::Acquire) == WRITING {
+            BloxrouteClientError::AcknowledgementUnknown {
+                tx_hash: self.tx_hash,
+                reason: "connection closed before acknowledgement",
+            }
+        } else {
+            BloxrouteClientError::Closed
+        }
+    }
+
+    fn outcome(
+        &self,
+        result: Result<(), BloxrouteClientError>,
+        response_received_at: Option<Timestamp>,
+    ) -> SubmissionOutcome {
+        // Read completion first: observing it must also observe the preceding start.
+        let write_completed_at = self.write_completed_at.get().copied();
+        let write_started_at = self.write_started_at.get().copied();
+
+        SubmissionOutcome {
+            tx_hash: self.tx_hash,
+            result,
+            timing: SubmissionTiming {
+                enqueued_at: self.enqueued_at,
+                write_started_at,
+                write_completed_at,
+                response_received_at,
+            },
+        }
     }
 }
 
-#[cfg_attr(test, derive(Debug))]
-struct Submission {
-    id: u64,
-    text: String,
-    pending: Pending,
-    attempted: Arc<AtomicU8>,
+#[derive(Debug)]
+struct CancelQueued {
+    state: Arc<SubmissionState>,
 }
 
-#[cfg_attr(test, derive(Debug))]
+impl Drop for CancelQueued {
+    fn drop(&mut self) {
+        let _ = self.state.phase.compare_exchange(
+            QUEUED,
+            CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[derive(Debug)]
+struct QueuedSubmission {
+    id: u64,
+    generation: u64,
+    text: String,
+    pending: Pending,
+}
+
+#[derive(Debug)]
 struct Pending {
-    tx_hash: B256,
+    state: Arc<SubmissionState>,
     deadline: Instant,
-    reply: oneshot::Sender<Result<B256, BloxrouteClientError>>,
-    _permit: OwnedSemaphorePermit,
+    reply: Option<oneshot::Sender<SubmissionOutcome>>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Pending {
+    fn finish(&mut self, result: Result<(), BloxrouteClientError>, received_at: Option<Timestamp>) {
+        // Capacity must be available before another thread observes completion.
+        drop(self.permit.take());
+
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(self.state.outcome(result, received_at));
+        }
+    }
+
+    fn observer_closed(&self) -> bool {
+        self.reply.as_ref().is_none_or(oneshot::Sender::is_closed)
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // Resolve even if the driver is aborted or a socket operation fails.
+        self.finish(Err(self.state.delivery_error()), None);
+    }
 }
 
 impl BloxrouteClient {
-    /// Create a client using the shared bloXroute Cloud API endpoint.
-    ///
-    /// Uses `wss://api.blxrbdn.com/ws` and [`BloxrouteOptions::default`].
-    /// `auth_header` is the complete `Authorization` value, used as supplied.
-    /// Construction performs no network I/O; the first submission connects lazily.
+    /// Create a client for `wss://api.blxrbdn.com/ws` using default options.
+    /// The complete `Authorization` value is used as supplied. No I/O starts yet.
     pub fn cloud(network: BloxrouteNetwork, auth_header: impl Into<String>) -> Self {
         Self::with_options(
             network,
@@ -238,18 +399,12 @@ impl BloxrouteClient {
         .expect("default bloXroute options are valid")
     }
 
-    /// Create a client with an explicit network, endpoint, and transport options.
-    ///
-    /// `endpoint` is a `ws://` or `wss://` URL. `auth_header` is the complete
-    /// `Authorization` value, used as supplied. Construction performs no network
-    /// I/O and validates only the transport options.
+    /// Create a client with an explicit `ws://` or `wss://` endpoint.
     ///
     /// # Errors
-    ///
     /// Returns [`BloxrouteClientError::InvalidOptions`] for zero deadlines or
-    /// limits, a request budget below 256 bytes, or an in-flight limit exceeding
-    /// Tokio's semaphore capacity. Endpoint and header errors are reported when
-    /// connecting.
+    /// limits, a request budget below 256 bytes, or a limit exceeding Tokio's
+    /// semaphore capacity. Endpoint and header validation happens at connection.
     pub fn with_options(
         network: BloxrouteNetwork,
         endpoint: impl Into<String>,
@@ -268,11 +423,12 @@ impl BloxrouteClient {
         {
             return Err(BloxrouteClientError::InvalidOptions);
         }
+
         Ok(Self {
             network,
             endpoint: endpoint.into(),
             auth_header: auth_header.into(),
-            connection: Mutex::new(None),
+            driver: OnceLock::new(),
             slots: Arc::new(Semaphore::new(options.max_in_flight)),
             id: AtomicU64::new(1),
             options,
@@ -284,221 +440,389 @@ impl BloxrouteClient {
         self.network
     }
 
-    /// Warm the connection; queueing behind another connection attempt is bounded too.
+    /// Start the persistent driver and wait for a connected socket.
     ///
-    /// This is optional: [`Self::send_raw_tx`] establishes a connection as needed.
-    /// Uses [`BloxrouteOptions::connect_timeout`] and sends no transaction.
+    /// Requires a Tokio runtime with I/O and time enabled. Network failures are
+    /// retried in the background with 100 ms–1 s backoff. Warmup is bounded by
+    /// `connect_timeout`; a timeout leaves the driver reconnecting.
     pub async fn connect(&self) -> Result<(), BloxrouteClientError> {
-        timeout(self.options.connect_timeout, self.get_connection())
-            .await
-            .map_err(|_| BloxrouteClientError::Timeout)?
-            .map(|_| ())
+        timeout(
+            self.options.connect_timeout,
+            wait_connected(self.start_driver()?),
+        )
+        .await
+        .map_err(|_| BloxrouteClientError::Timeout)?
     }
 
-    /// Submit signed transaction bytes and return the acknowledged transaction hash.
+    /// Immediately enqueue signed bytes using their already computed hash.
     ///
-    /// `tx_bytes` must contain the complete signed transaction encoding for this
-    /// client's network. The client does not sign transactions or validate their
-    /// chain ID. Success verifies the acknowledged hash against the input bytes;
-    /// on-chain inclusion must be tracked separately.
+    /// Call [`Self::connect`] before submitting. This method never waits for a
+    /// connection, capacity, write, or acknowledgement. The driver may begin
+    /// sending before this returns, without calling [`Submission::wait`]. Record
+    /// the transaction locally before calling this method.
     ///
-    /// `reward_address` is supported on BNB Smart Chain, Base, and Robinhood.
-    /// Ethereum's public submission route requires `None`.
-    ///
-    /// The request deadline includes queueing, connection setup, writing, and
-    /// acknowledgement. Cancelling before a write prevents a queued submission
-    /// from being sent; cancellation after a write leaves delivery uncertain.
+    /// `tx_hash` must be the hash of exactly `tx_bytes`. It is deliberately not
+    /// recomputed; the server's response is checked against it. The client does
+    /// not sign transactions or validate their chain ID. Ethereum requires
+    /// `reward_address` to be `None`.
     ///
     /// # Errors
+    /// [`BloxrouteClientError::NotConnected`] and [`BloxrouteClientError::Full`]
+    /// reject admission immediately. Every error returned directly by this
+    /// method means nothing was enqueued. After admission, call
+    /// [`Submission::wait`] and use [`BloxrouteClientError::may_have_been_submitted`]
+    /// on its outcome.
+    pub fn try_submit(
+        &self,
+        tx_bytes: &[u8],
+        tx_hash: B256,
+        reward_address: Option<Address>,
+    ) -> Result<Submission, BloxrouteClientError> {
+        let deadline = Instant::now() + self.options.request_timeout;
+        self.validate_submission(tx_bytes, reward_address)?;
+
+        let driver = self
+            .driver
+            .get()
+            .ok_or(BloxrouteClientError::NotConnected)?;
+        let permit = Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|_| BloxrouteClientError::Full)?;
+
+        self.enqueue(driver, tx_bytes, tx_hash, reward_address, permit, deadline)
+    }
+
+    /// Convenience API: compute the hash, wait for capacity and connection, then
+    /// await acknowledgement. Use [`Self::try_submit`] for immediate admission.
     ///
-    /// A connection failure or deadline after a write attempt returns
-    /// [`BloxrouteClientError::AcknowledgementUnknown`]; the client never silently
-    /// resubmits that transaction. Use
-    /// [`BloxrouteClientError::may_have_been_submitted`] to decide whether delivery
-    /// needs reconciliation before retrying. Unsupported reward addresses and
-    /// oversized transactions are rejected before connecting.
+    /// The whole operation is bounded by `request_timeout`. Dropping the future
+    /// before a write starts prevents sending; later cancellation leaves delivery
+    /// uncertain. A disconnected request is never replayed on another connection.
     pub async fn send_raw_tx(
         &self,
         tx_bytes: &[u8],
         reward_address: Option<Address>,
     ) -> Result<B256, BloxrouteClientError> {
+        let deadline = Instant::now() + self.options.request_timeout;
+        self.validate_submission(tx_bytes, reward_address)?;
+        let hash = keccak256(tx_bytes);
+
+        let submission = timeout_at(deadline, async {
+            let permit = Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| BloxrouteClientError::Closed)?;
+            let driver = self.start_driver()?;
+            wait_connected(driver).await?;
+
+            self.enqueue(driver, tx_bytes, hash, reward_address, permit, deadline)
+        })
+        .await
+        .map_err(|_| BloxrouteClientError::Timeout)??;
+
+        let outcome = submission.wait().await;
+        outcome.result.map(|()| outcome.tx_hash)
+    }
+
+    fn validate_submission(
+        &self,
+        tx_bytes: &[u8],
+        reward_address: Option<Address>,
+    ) -> Result<(), BloxrouteClientError> {
         if reward_address.is_some() && !self.network.supports_reward_address() {
             return Err(BloxrouteClientError::UnsupportedRewardAddress {
                 network: self.network,
             });
         }
-        let deadline = Instant::now() + self.options.request_timeout;
-        let attempted = Arc::new(AtomicU8::new(QUEUED));
-        let _cancel_queued = CancelQueued(Arc::clone(&attempted));
+
         if tx_bytes.len() > (self.options.max_request_bytes - 256) / 2 {
             return Err(BloxrouteClientError::RequestTooLarge {
                 limit: self.options.max_request_bytes,
             });
         }
-        let tx_hash = keccak256(tx_bytes);
-        let result = timeout_at(deadline, async {
-            let permit = Arc::clone(&self.slots)
-                .acquire_owned()
-                .await
-                .map_err(|_| BloxrouteClientError::Closed)?;
-            let id = self.id.fetch_add(1, Ordering::Relaxed);
-            let text = build_request(self.network, tx_bytes, reward_address, id);
-            let (reply, response) = oneshot::channel();
-            let mut request = Submission {
-                id,
-                text,
-                attempted: Arc::clone(&attempted),
-                pending: Pending {
-                    tx_hash,
-                    deadline,
-                    reply,
-                    _permit: permit,
-                },
-            };
-            // Retry only if the old connection closed before accepting the command.
-            for attempt in 0..2 {
-                let connection = self.get_connection().await?;
-                match connection.requests.send(request).await {
-                    Ok(()) => {
-                        return response.await.unwrap_or_else(|_| {
-                            Err(if attempted.load(Ordering::Acquire) == WRITING {
-                                BloxrouteClientError::AcknowledgementUnknown {
-                                    tx_hash,
-                                    reason: "connection closed before acknowledgement",
-                                }
-                            } else {
-                                BloxrouteClientError::Closed
-                            })
-                        });
-                    }
-                    Err(error) if attempt == 0 => request = error.0,
-                    Err(_) => return Err(BloxrouteClientError::Closed),
-                }
-            }
-            unreachable!()
-        })
-        .await;
-        result.unwrap_or_else(|_| {
-            let previous =
-                attempted.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
-            Err(if matches!(previous, Err(WRITING)) {
-                BloxrouteClientError::AcknowledgementUnknown {
-                    tx_hash,
-                    reason: "submission deadline elapsed",
-                }
-            } else {
-                BloxrouteClientError::Timeout
-            })
+
+        Ok(())
+    }
+
+    fn enqueue(
+        &self,
+        driver: &Driver,
+        tx_bytes: &[u8],
+        tx_hash: B256,
+        reward_address: Option<Address>,
+        permit: OwnedSemaphorePermit,
+        deadline: Instant,
+    ) -> Result<Submission, BloxrouteClientError> {
+        let generation = driver.generation.load(Ordering::Acquire);
+        if generation == 0 {
+            return Err(BloxrouteClientError::NotConnected);
+        }
+        if Instant::now() >= deadline {
+            return Err(BloxrouteClientError::Timeout);
+        }
+
+        let id = self.id.fetch_add(1, Ordering::Relaxed);
+        let text = build_request(self.network, tx_bytes, reward_address, id);
+
+        let (reply, response) = oneshot::channel();
+        let state = Arc::new(SubmissionState::new(tx_hash));
+        let request = QueuedSubmission {
+            id,
+            generation,
+            text,
+            pending: Pending {
+                state: Arc::clone(&state),
+                deadline,
+                reply: Some(reply),
+                permit: Some(permit),
+            },
+        };
+
+        driver
+            .requests
+            .try_send(request)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => BloxrouteClientError::Full,
+                mpsc::error::TrySendError::Closed(_) => BloxrouteClientError::Closed,
+            })?;
+
+        Ok(Submission {
+            deadline,
+            response,
+            cancellation: CancelQueued { state },
         })
     }
 
-    async fn get_connection(&self) -> Result<Arc<Connection>, BloxrouteClientError> {
-        let mut slot = self.connection.lock().await;
-        if let Some(connection) = slot
-            .as_ref()
-            .filter(|connection| !connection.requests.is_closed())
-        {
-            return Ok(Arc::clone(connection));
+    fn start_driver(&self) -> Result<&Driver, BloxrouteClientError> {
+        if let Some(driver) = self.driver.get() {
+            return Ok(driver);
         }
+
         let mut request = self.endpoint.as_str().into_client_request()?;
         let mut authorization = HeaderValue::from_str(&self.auth_header)
             .map_err(|_| BloxrouteClientError::InvalidAuthHeader)?;
         authorization.set_sensitive(true);
         request.headers_mut().insert(AUTHORIZATION, authorization);
-        let mut config = WebSocketConfig::default();
-        config.read_buffer_size = 16 * 1024;
-        config.write_buffer_size = 16 * 1024;
-        config.max_message_size = Some(self.options.max_response_bytes);
-        config.max_frame_size = Some(self.options.max_response_bytes);
-        let (socket, _) = timeout(
-            self.options.connect_timeout,
-            connect_async_with_config(request, Some(config), true),
-        )
-        .await
-        .map_err(|_| BloxrouteClientError::Timeout)??;
-        let (requests, receiver) = mpsc::channel(self.options.max_in_flight);
-        let options = self.options;
-        let task = tokio::spawn(async move {
-            if let Err(error) = run_connection(socket, receiver, options).await {
-                tracing::debug!(%error, "bloXroute submission connection ended");
+
+        Ok(self.driver.get_or_init(|| {
+            let (requests, receiver) = mpsc::channel(self.options.max_in_flight);
+            let generation = Arc::new(AtomicU64::new(0));
+            let (ready, readiness) = watch::channel(());
+            let task = tokio::spawn(run_driver(
+                request,
+                receiver,
+                self.options,
+                Arc::clone(&generation),
+                ready,
+            ));
+
+            Driver {
+                requests,
+                generation,
+                readiness,
+                task: task.abort_handle(),
             }
-        });
-        let connection = Arc::new(Connection {
-            requests,
-            task: task.abort_handle(),
-        });
-        *slot = Some(Arc::clone(&connection));
-        Ok(connection)
+        }))
+    }
+}
+
+async fn wait_connected(driver: &Driver) -> Result<(), BloxrouteClientError> {
+    let mut readiness = driver.readiness.clone();
+
+    loop {
+        if driver.requests.is_closed() {
+            return Err(BloxrouteClientError::Closed);
+        }
+        if driver.generation.load(Ordering::Acquire) != 0 {
+            return Ok(());
+        }
+
+        readiness
+            .changed()
+            .await
+            .map_err(|_| BloxrouteClientError::Closed)?;
+    }
+}
+
+async fn run_driver(
+    request: Handshake,
+    mut requests: mpsc::Receiver<QueuedSubmission>,
+    options: BloxrouteOptions,
+    generation: Arc<AtomicU64>,
+    readiness: watch::Sender<()>,
+) {
+    let mut config = WebSocketConfig::default();
+    config.read_buffer_size = 16 * 1024;
+    config.write_buffer_size = 16 * 1024;
+    config.max_message_size = Some(options.max_response_bytes);
+    config.max_frame_size = Some(options.max_response_bytes);
+
+    let mut next_generation = 1_u64;
+    let mut delay = Duration::ZERO;
+    let mut backoff = RECONNECT_MIN;
+
+    loop {
+        // Late admissions from the previous connection are rejected even while
+        // reconnecting. No queued transaction crosses connection generations.
+        let connection = {
+            let connecting = async {
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+
+                timeout(
+                    options.connect_timeout,
+                    connect_async_with_config(request.clone(), Some(config), true),
+                )
+                .await
+            };
+            tokio::pin!(connecting);
+
+            loop {
+                tokio::select! {
+                    result = &mut connecting => break result,
+                    queued = requests.recv() => match queued {
+                        Some(queued) => drop(queued),
+                        None => return,
+                    },
+                }
+            }
+        };
+
+        match connection {
+            Ok(Ok((socket, _))) => {
+                let current_generation = next_generation;
+                let Some(next) = next_generation.checked_add(1) else {
+                    return;
+                };
+                next_generation = next;
+
+                generation.store(current_generation, Ordering::Release);
+                readiness.send_replace(());
+                backoff = RECONNECT_MIN;
+
+                let result =
+                    run_connection(socket, &mut requests, options, current_generation).await;
+                generation.store(0, Ordering::Release);
+                readiness.send_replace(());
+
+                match result {
+                    Ok(()) => return,
+                    Err(error) => {
+                        tracing::debug!(%error, "bloXroute connection ended; reconnecting")
+                    }
+                }
+            }
+            Ok(Err(error)) => tracing::debug!(%error, "bloXroute connection failed; retrying"),
+            Err(_) => tracing::debug!("bloXroute connection timed out; retrying"),
+        }
+
+        delay = backoff;
+        backoff = (backoff * 2).min(RECONNECT_MAX);
     }
 }
 
 async fn run_connection<S>(
     mut socket: WebSocketStream<S>,
-    mut requests: mpsc::Receiver<Submission>,
+    requests: &mut mpsc::Receiver<QueuedSubmission>,
     options: BloxrouteOptions,
+    generation: u64,
 ) -> Result<(), BloxrouteClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut pending: FastMap<u64, Pending> =
         FastMap::with_capacity_and_hasher(options.max_in_flight, Default::default());
+
     let mut ping = interval(options.ping_interval);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ping.tick().await;
     let mut pong_deadline: Option<Instant> = None;
+
     loop {
         let now = Instant::now();
         if pong_deadline.is_some_and(|deadline| deadline <= now) {
             return Err(BloxrouteClientError::Closed);
         }
-        for (_, request) in
-            pending.extract_if(|_, request| request.deadline <= now || request.reply.is_closed())
+
+        for (_, mut request) in
+            pending.extract_if(|_, request| request.deadline <= now || request.observer_closed())
         {
-            let _ = request
-                .reply
-                .send(Err(BloxrouteClientError::AcknowledgementUnknown {
-                    tx_hash: request.tx_hash,
+            request.finish(
+                Err(BloxrouteClientError::AcknowledgementUnknown {
+                    tx_hash: request.state.tx_hash,
                     reason: "submission deadline elapsed",
-                }));
+                }),
+                None,
+            );
         }
+
         let next_deadline = pending
             .values()
             .map(|request| request.deadline)
             .chain(pong_deadline)
             .min()
             .unwrap_or(now + Duration::from_secs(3600));
+
         tokio::select! {
             _ = tokio::time::sleep_until(next_deadline) => {}
             request = requests.recv() => {
-                let Some(request) = request else { return Ok(()); };
-                if request.pending.reply.is_closed() || request.pending.deadline <= Instant::now() {
-                    let _ = request.pending.reply.send(Err(BloxrouteClientError::Timeout));
+                let Some(mut request) = request else {
+                    return Ok(());
+                };
+
+                if request.generation != generation {
+                    request.pending.finish(Err(BloxrouteClientError::Closed), None);
                     continue;
                 }
-                let deadline = request.pending.deadline.min(Instant::now() + options.write_timeout);
-                if request.attempted.compare_exchange(QUEUED, WRITING, Ordering::AcqRel, Ordering::Acquire).is_err() {
-                    let _ = request.pending.reply.send(Err(BloxrouteClientError::Timeout));
+
+                if request.pending.observer_closed()
+                    || request.pending.deadline <= Instant::now()
+                {
+                    request.pending.finish(Err(BloxrouteClientError::Timeout), None);
                     continue;
                 }
-                pending.insert(request.id, request.pending);
-                timeout_at(deadline, socket.send(Message::Text(request.text.into()))).await
+
+                let state = &request.pending.state;
+                if state
+                    .phase
+                    .compare_exchange(QUEUED, WRITING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    request.pending.finish(Err(BloxrouteClientError::Timeout), None);
+                    continue;
+                }
+
+                let deadline = request.pending.deadline
+                    .min(Instant::now() + options.write_timeout);
+                let _ = state.write_started_at.set(Instant::now().into_std());
+                timeout_at(deadline, socket.send(Message::Text(request.text.into())))
+                    .await
                     .map_err(|_| BloxrouteClientError::Closed)??;
+                let _ = state.write_completed_at.set(Instant::now().into_std());
+
+                pending.insert(request.id, request.pending);
             }
             response = socket.next() => match response {
                 Some(Ok(Message::Text(text))) => {
+                    let received_at = Instant::now().into_std();
                     let (id, result) = parse_response(&text)?;
-                    if let Some(request) = pending.remove(&id) {
+                    if let Some(mut request) = pending.remove(&id) {
                         let result = match result {
-                            Ok(hash) if hash != request.tx_hash => Err(BloxrouteClientError::AcknowledgementUnknown {
-                                tx_hash: request.tx_hash, reason: "response transaction hash mismatch",
-                            }),
-                            other => other,
+                            Ok(hash) if hash != request.state.tx_hash => {
+                                Err(BloxrouteClientError::AcknowledgementUnknown {
+                                    tx_hash: request.state.tx_hash,
+                                    reason: "response transaction hash mismatch",
+                                })
+                            }
+                            result => result.map(|_| ()),
                         };
-                        let _ = request.reply.send(result);
+                        request.finish(result, Some(received_at));
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    timeout(options.write_timeout, socket.send(Message::Pong(payload))).await
+                    timeout(options.write_timeout, socket.send(Message::Pong(payload)))
+                        .await
                         .map_err(|_| BloxrouteClientError::Closed)??;
                 }
                 Some(Ok(Message::Pong(_))) => pong_deadline = None,
@@ -507,7 +831,8 @@ where
                 _ => {}
             },
             _ = ping.tick(), if pong_deadline.is_none() => {
-                timeout(options.write_timeout, socket.send(Message::Ping(Default::default()))).await
+                timeout(options.write_timeout, socket.send(Message::Ping(Default::default())))
+                    .await
                     .map_err(|_| BloxrouteClientError::Closed)??;
                 pong_deadline = Some(Instant::now() + options.pong_timeout);
             }
@@ -640,6 +965,51 @@ mod tests {
         (listener, client)
     }
 
+    fn test_client(options: BloxrouteOptions) -> BloxrouteClient {
+        BloxrouteClient::with_options(BloxrouteNetwork::Base, "ws://127.0.0.1:1", "test", options)
+            .unwrap()
+    }
+
+    type TestSocket = WebSocketStream<tokio::io::DuplexStream>;
+
+    async fn socket_pair(capacity: usize) -> (TestSocket, TestSocket) {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, server) = tokio::io::duplex(capacity);
+        (
+            WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+            WebSocketStream::from_raw_socket(server, Role::Server, None).await,
+        )
+    }
+
+    fn attach_socket<S>(
+        client: &BloxrouteClient,
+        socket: WebSocketStream<S>,
+        generation: u64,
+    ) -> tokio::task::JoinHandle<Result<(), BloxrouteClientError>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (requests, mut receiver) = mpsc::channel(client.options.max_in_flight);
+        let (ready, readiness) = watch::channel(());
+        let options = client.options;
+        let task = tokio::spawn(async move {
+            let _ready = ready;
+            run_connection(socket, &mut receiver, options, generation).await
+        });
+        assert!(
+            client
+                .driver
+                .set(Driver {
+                    requests,
+                    generation: Arc::new(AtomicU64::new(generation)),
+                    readiness,
+                    task: task.abort_handle(),
+                })
+                .is_ok()
+        );
+        task
+    }
+
     fn response_for(request: &Message) -> Message {
         let request: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
         let hex = request["params"]["transaction"].as_str().unwrap();
@@ -763,7 +1133,7 @@ mod tests {
             }
         ));
         assert!(!error.may_have_been_submitted());
-        assert!(client.connection.lock().await.is_none());
+        assert!(client.driver.get().is_none());
     }
 
     #[tokio::test]
@@ -786,28 +1156,397 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[test]
+    fn immediate_admission_requires_warmup_and_valid_input() {
+        let client = test_client(test_options());
+        let error = client.try_submit(&[1], keccak256([1]), None).unwrap_err();
+        assert!(matches!(error, BloxrouteClientError::NotConnected));
+        assert!(!error.may_have_been_submitted());
+        assert!(client.driver.get().is_none());
+
+        let client = test_client(BloxrouteOptions {
+            max_request_bytes: 258,
+            ..test_options()
+        });
+        let error = client.try_submit(&[1, 2], B256::ZERO, None).unwrap_err();
+        assert!(matches!(
+            error,
+            BloxrouteClientError::RequestTooLarge { .. }
+        ));
+        assert!(!error.may_have_been_submitted());
+        assert_eq!(
+            client.slots.available_permits(),
+            client.options.max_in_flight
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_submissions_send_without_waiters_and_match_reversed_responses() {
+        let client = test_client(test_options());
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let first = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        let second = client.try_submit(&[2], keccak256([2]), None).unwrap();
+
+        // Neither acknowledgement handle is polled while both requests are sent.
+        let first_request = peer.next().await.unwrap().unwrap();
+        let second_request = peer.next().await.unwrap().unwrap();
+        peer.send(response_for(&second_request)).await.unwrap();
+        peer.send(response_for(&first_request)).await.unwrap();
+
+        for (submission, hash) in [(first, keccak256([1])), (second, keccak256([2]))] {
+            assert_eq!(submission.tx_hash(), hash);
+            let outcome = submission.wait().await;
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.tx_hash, hash);
+            let timing = outcome.timing;
+            assert!(timing.enqueued_at <= timing.write_started_at.unwrap());
+            assert!(timing.write_started_at.unwrap() <= timing.write_completed_at.unwrap());
+            assert!(timing.write_completed_at.unwrap() <= timing.response_received_at.unwrap());
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn full_capacity_rejects_immediately_and_reopens_after_acknowledgement() {
+        let client = test_client(BloxrouteOptions {
+            max_in_flight: 1,
+            ..test_options()
+        });
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let first = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        let request = peer.next().await.unwrap().unwrap();
+        let error = client.try_submit(&[2], keccak256([2]), None).unwrap_err();
+        assert!(matches!(error, BloxrouteClientError::Full));
+        assert!(!error.may_have_been_submitted());
+
+        peer.send(response_for(&request)).await.unwrap();
+        // Capacity belongs to the driver, not to the unpolled result handle.
+        timeout(Duration::from_secs(1), async {
+            while client.slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = client.try_submit(&[2], keccak256([2]), None).unwrap();
+        let request = peer.next().await.unwrap().unwrap();
+        peer.send(response_for(&request)).await.unwrap();
+        assert!(first.wait().await.result.is_ok());
+        assert!(second.wait().await.result.is_ok());
+        task.abort();
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn submission_deadline_includes_admission_and_connection_lock() {
+    async fn driver_expires_written_requests_without_polling_the_handle() {
+        let options = test_options();
+        let client = test_client(options);
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        let _request = peer.next().await.unwrap().unwrap();
+        tokio::time::advance(options.request_timeout).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(client.slots.available_permits(), options.max_in_flight);
+        let outcome = submission.wait().await;
+        assert!(outcome.result.unwrap_err().may_have_been_submitted());
+        assert!(outcome.timing.write_started_at.is_some());
+        assert!(outcome.timing.write_completed_at.is_some());
+        assert!(outcome.timing.response_received_at.is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn driver_abort_preserves_delivery_evidence_and_releases_capacity() {
+        for written in [false, true] {
+            let client = test_client(test_options());
+            let (socket, mut peer) = socket_pair(1024).await;
+            let task = attach_socket(&client, socket, 1);
+            let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+            if written {
+                let _request = peer.next().await.unwrap().unwrap();
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+
+            let outcome = submission.wait().await;
+            assert_eq!(
+                outcome.result.unwrap_err().may_have_been_submitted(),
+                written
+            );
+            assert_eq!(outcome.timing.write_started_at.is_some(), written);
+            assert_eq!(outcome.timing.write_completed_at.is_some(), written);
+            assert_eq!(
+                client.slots.available_permits(),
+                client.options.max_in_flight
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_server_hash_keeps_the_supplied_hash_and_write_timing() {
+        let client = test_client(test_options());
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let hash = keccak256([1]);
+        let submission = client.try_submit(&[1], hash, None).unwrap();
+        let _request = peer.next().await.unwrap().unwrap();
+        peer.send(Message::Text(
+            format!(r#"{{"id":1,"result":{{"txHash":"{}"}}}}"#, B256::ZERO,).into(),
+        ))
+        .await
+        .unwrap();
+
+        let outcome = submission.wait().await;
+        assert_eq!(outcome.tx_hash, hash);
+        assert!(
+            matches!(outcome.result, Err(BloxrouteClientError::AcknowledgementUnknown { tx_hash, .. }) if tx_hash == hash)
+        );
+        assert!(outcome.timing.write_completed_at.is_some());
+        assert!(outcome.timing.response_received_at.is_some());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_reconnects_without_another_submission() {
+        let (listener, client) = listener_client(BloxrouteNetwork::Base, test_options()).await;
+        let (disconnect, disconnect_now) = oneshot::channel();
+        let (reconnected, observe_reconnect) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            disconnect_now.await.unwrap();
+            socket.close(None).await.unwrap();
+            drop(socket);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            reconnected.send(()).unwrap();
+            let request = socket.next().await.unwrap().unwrap();
+            socket.send(response_for(&request)).await.unwrap();
+        });
+        client.connect().await.unwrap();
+        disconnect.send(()).unwrap();
+
+        // No client method is invoked to trigger reconnection.
+        timeout(Duration::from_secs(2), observe_reconnect)
+            .await
+            .unwrap()
+            .unwrap();
+        client.connect().await.unwrap();
+        let outcome = client
+            .try_submit(&[1], keccak256([1]), None)
+            .unwrap()
+            .wait()
+            .await;
+        assert!(outcome.result.is_ok());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn socket_driver_progresses_while_the_submitting_thread_is_blocked() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (listener, client) = listener_client(BloxrouteNetwork::Base, test_options()).await;
+            let (written, observed) = std::sync::mpsc::sync_channel(1);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request = socket.next().await.unwrap().unwrap();
+                written.send(()).unwrap();
+                socket.send(response_for(&request)).await.unwrap();
+            });
+            client.connect().await.unwrap();
+            let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+
+            // Deliberately block the submitting thread. The single runtime
+            // worker must send the request without any per-submission task.
+            observed.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(submission.wait().await.result.is_ok());
+            server.await.unwrap();
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_deadline_cancels_queued_work_behind_a_blocked_write() {
+        let options = BloxrouteOptions {
+            request_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(1),
+            ..test_options()
+        };
+        let client = test_client(options);
+        let (socket, _peer) = socket_pair(1).await;
+        let task = attach_socket(&client, socket, 1);
+        let first = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            first.cancellation.state.phase.load(Ordering::Acquire),
+            WRITING
+        );
+
+        // The convenience API can arrive with an earlier deadline after waiting
+        // for admission. Its waiter must expire even while the driver is writing.
+        let second = client
+            .enqueue(
+                client.driver.get().unwrap(),
+                &[2],
+                keccak256([2]),
+                None,
+                Arc::clone(&client.slots).try_acquire_owned().unwrap(),
+                Instant::now() + Duration::from_millis(20),
+            )
+            .unwrap();
+        let state = Arc::clone(&second.cancellation.state);
+        let started = Instant::now();
+        let outcome = second.wait().await;
+        assert!(matches!(outcome.result, Err(BloxrouteClientError::Timeout)));
+        assert!(outcome.timing.write_started_at.is_none());
+        assert_eq!(state.phase.load(Ordering::Acquire), CANCELLED);
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+
+        task.abort();
+        assert!(
+            first
+                .wait()
+                .await
+                .result
+                .unwrap_err()
+                .may_have_been_submitted()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_client_stops_its_driver_and_resolves_submissions() {
+        let (listener, client) = listener_client(BloxrouteNetwork::Base, test_options()).await;
+        let (written, observed) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _request = socket.next().await.unwrap().unwrap();
+            written.send(()).unwrap();
+            assert!(matches!(
+                socket.next().await,
+                None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+            ));
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        client.connect().await.unwrap();
+        let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        observed.await.unwrap();
+        drop(client);
+
+        let outcome = submission.wait().await;
+        assert!(outcome.result.unwrap_err().may_have_been_submitted());
+        assert!(outcome.timing.write_completed_at.is_some());
+        timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    #[ignore = "manual loopback latency benchmark; no live transactions"]
+    fn local_submission_latency_under_cpu_load() {
+        const SAMPLES: usize = 1_000;
+        const WARMUP: usize = 100;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (listener, client) = listener_client(BloxrouteNetwork::Base, test_options()).await;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for _ in 0..(SAMPLES + WARMUP) * 2 {
+                    let request = socket.next().await.unwrap().unwrap();
+                    socket.send(response_for(&request)).await.unwrap();
+                }
+            });
+            client.connect().await.unwrap();
+            let bytes = [0xab; 512];
+            let hash = keccak256(bytes);
+
+            for load in [Duration::ZERO, Duration::from_micros(200)] {
+                let mut admission = Vec::with_capacity(SAMPLES);
+                let mut write_start = Vec::with_capacity(SAMPLES);
+                let mut write_complete = Vec::with_capacity(SAMPLES);
+                for index in 0..SAMPLES + WARMUP {
+                    let started = Timestamp::now();
+                    let submission = client.try_submit(&bytes, hash, None).unwrap();
+                    let admitted = Timestamp::now();
+                    while admitted.elapsed() < load {
+                        std::hint::spin_loop();
+                    }
+                    let outcome = submission.wait().await;
+                    outcome.result.unwrap();
+                    if index >= WARMUP {
+                        admission.push(admitted.duration_since(started));
+                        write_start.push(
+                            outcome
+                                .timing
+                                .write_started_at
+                                .unwrap()
+                                .duration_since(started),
+                        );
+                        write_complete.push(
+                            outcome
+                                .timing
+                                .write_completed_at
+                                .unwrap()
+                                .duration_since(started),
+                        );
+                    }
+                }
+                for (name, mut samples) in [
+                    ("admission", admission),
+                    ("write_start", write_start),
+                    ("write_complete", write_complete),
+                ] {
+                    samples.sort_unstable();
+                    println!(
+                        "load={load:?} {name}: p50={:?} p99={:?} max={:?}",
+                        samples[SAMPLES / 2],
+                        samples[SAMPLES * 99 / 100],
+                        samples[SAMPLES - 1]
+                    );
+                }
+            }
+            server.await.unwrap();
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn convenience_deadline_includes_capacity_and_reconnection() {
         let options = BloxrouteOptions {
             max_in_flight: 1,
             request_timeout: Duration::from_millis(20),
             ..test_options()
         };
-        let client = BloxrouteClient::with_options(
-            BloxrouteNetwork::Base,
-            "ws://127.0.0.1:1",
-            "test",
-            options,
-        )
-        .unwrap();
+        let client = test_client(options);
         let occupied = Arc::clone(&client.slots).acquire_owned().await.unwrap();
         let started = Instant::now();
         let error = client.send_raw_tx(&[1], None).await.unwrap_err();
         assert!(matches!(error, BloxrouteClientError::Timeout));
         assert!(!error.may_have_been_submitted());
         assert_eq!(started.elapsed(), options.request_timeout);
+
         drop(occupied);
-        let _connecting = client.connection.lock().await;
+
         let started = Instant::now();
         let error = client.send_raw_tx(&[1], None).await.unwrap_err();
         assert!(matches!(error, BloxrouteClientError::Timeout));
@@ -835,7 +1574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_loss_after_write_is_unknown_and_next_call_reconnects() {
+    async fn connection_loss_is_unknown_and_later_submissions_succeed() {
         let (listener, client) = listener_client(BloxrouteNetwork::Base, test_options()).await;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -867,26 +1606,9 @@ mod tests {
             write_timeout: Duration::from_millis(10),
             ..test_options()
         };
-        let client = BloxrouteClient::with_options(
-            BloxrouteNetwork::Base,
-            "ws://127.0.0.1:1",
-            "test",
-            options,
-        )
-        .unwrap();
-        let (transport, _peer) = tokio::io::duplex(1);
-        let socket = WebSocketStream::from_raw_socket(
-            transport,
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        let (requests, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_connection(socket, receiver, options));
-        *client.connection.lock().await = Some(Arc::new(Connection {
-            requests,
-            task: task.abort_handle(),
-        }));
+        let client = test_client(options);
+        let (socket, _peer) = socket_pair(1).await;
+        let task = attach_socket(&client, socket, 1);
         let started = Instant::now();
         let error = client.send_raw_tx(&[1], None).await.unwrap_err();
         assert!(matches!(
@@ -902,32 +1624,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn acknowledgement_deadline_after_write_requires_reconciliation() {
         let options = test_options();
-        let client = BloxrouteClient::with_options(
-            BloxrouteNetwork::Base,
-            "ws://127.0.0.1:1",
-            "test",
-            options,
-        )
-        .unwrap();
-        let (transport, peer) = tokio::io::duplex(1024);
-        let socket = WebSocketStream::from_raw_socket(
-            transport,
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        let mut peer = WebSocketStream::from_raw_socket(
-            peer,
-            tokio_tungstenite::tungstenite::protocol::Role::Server,
-            None,
-        )
-        .await;
-        let (requests, receiver) = mpsc::channel(1);
-        let task = tokio::spawn(run_connection(socket, receiver, options));
-        *client.connection.lock().await = Some(Arc::new(Connection {
-            requests,
-            task: task.abort_handle(),
-        }));
+        let client = test_client(options);
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
 
         let started = Instant::now();
         let (result, ()) = tokio::join!(client.send_raw_tx(&[1], None), async {
@@ -954,43 +1653,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expired_queued_transactions_are_not_written() {
         let options = test_options();
-        let (transport, peer) = tokio::io::duplex(1024);
-        let socket = WebSocketStream::from_raw_socket(
-            transport,
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        let mut peer = WebSocketStream::from_raw_socket(
-            peer,
-            tokio_tungstenite::tungstenite::protocol::Role::Server,
-            None,
-        )
-        .await;
-        let (requests, receiver) = mpsc::channel(1);
-        let (reply, response) = oneshot::channel();
-        let attempted = Arc::new(AtomicU8::new(QUEUED));
-        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
-        requests
-            .send(Submission {
-                id: 1,
-                text: build_request(BloxrouteNetwork::Base, &[1], None, 1),
-                attempted: Arc::clone(&attempted),
-                pending: Pending {
-                    tx_hash: keccak256([1]),
-                    deadline: Instant::now() - Duration::from_millis(1),
-                    reply,
-                    _permit: permit,
-                },
-            })
-            .await
-            .unwrap();
-        let task = tokio::spawn(run_connection(socket, receiver, options));
-        assert!(matches!(
-            response.await.unwrap(),
-            Err(BloxrouteClientError::Timeout)
-        ));
-        assert_eq!(attempted.load(Ordering::Acquire), QUEUED);
+        let client = test_client(options);
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+
+        // The driver has not been polled yet. Expiry must prevent a late write.
+        tokio::time::advance(options.request_timeout).await;
+        let outcome = submission.wait().await;
+        assert!(matches!(outcome.result, Err(BloxrouteClientError::Timeout)));
+        assert!(outcome.timing.write_started_at.is_none());
         assert!(
             timeout(Duration::from_millis(10), peer.next())
                 .await
@@ -1000,51 +1672,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_wins_atomically_before_a_queued_write() {
-        let options = test_options();
-        let (transport, peer) = tokio::io::duplex(1024);
-        let socket = WebSocketStream::from_raw_socket(
-            transport,
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        let mut peer = WebSocketStream::from_raw_socket(
-            peer,
-            tokio_tungstenite::tungstenite::protocol::Role::Server,
-            None,
-        )
-        .await;
-        let (requests, receiver) = mpsc::channel(1);
-        let (reply, response) = oneshot::channel();
-        let attempted = Arc::new(AtomicU8::new(QUEUED));
-        let cancellation = CancelQueued(Arc::clone(&attempted));
-        requests
-            .send(Submission {
-                id: 1,
-                text: build_request(BloxrouteNetwork::Base, &[1], None, 1),
-                attempted: Arc::clone(&attempted),
-                pending: Pending {
-                    tx_hash: keccak256([1]),
-                    deadline: Instant::now() + options.request_timeout,
-                    reply,
-                    _permit: Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap(),
-                },
-            })
-            .await
-            .unwrap();
-        drop(cancellation);
-        let task = tokio::spawn(run_connection(socket, receiver, options));
-        assert!(matches!(
-            response.await.unwrap(),
-            Err(BloxrouteClientError::Timeout)
-        ));
-        assert_eq!(attempted.load(Ordering::Acquire), CANCELLED);
+    async fn dropping_an_unwritten_submission_prevents_sending() {
+        let client = test_client(test_options());
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 1);
+        let submission = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        let state = Arc::clone(&submission.cancellation.state);
+        drop(submission);
+
+        assert_eq!(state.phase.load(Ordering::Acquire), CANCELLED);
         assert!(
             timeout(Duration::from_millis(10), peer.next())
                 .await
                 .is_err()
         );
+        assert_eq!(
+            client.slots.available_permits(),
+            client.options.max_in_flight
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_from_a_previous_connection_is_never_replayed() {
+        let client = test_client(test_options());
+        let (socket, mut peer) = socket_pair(1024).await;
+        let task = attach_socket(&client, socket, 2);
+        let driver = client.driver.get().unwrap();
+        // Model a producer that read generation 1 before reconnect, then enqueued late.
+        driver.generation.store(1, Ordering::Release);
+        let stale = client.try_submit(&[1], keccak256([1]), None).unwrap();
+        driver.generation.store(2, Ordering::Release);
+        let fresh = client.try_submit(&[2], keccak256([2]), None).unwrap();
+
+        let stale = stale.wait().await;
+        assert!(matches!(stale.result, Err(BloxrouteClientError::Closed)));
+        assert!(stale.timing.write_started_at.is_none());
+        let request = peer.next().await.unwrap().unwrap();
+        assert!(request.to_text().unwrap().contains(r#""transaction":"02""#));
+        peer.send(response_for(&request)).await.unwrap();
+        assert!(fresh.wait().await.result.is_ok());
         task.abort();
     }
 

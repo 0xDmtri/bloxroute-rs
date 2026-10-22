@@ -3,9 +3,10 @@
 Async Rust library for submitting signed EVM transactions through bloXroute's
 WebSocket API. Supports Ethereum, BNB Smart Chain, Base, and Robinhood Chain.
 
-One client maintains a persistent connection for one network. Concurrent
+One client maintains a persistent socket driver for one network. Concurrent
 submissions share that connection, with bounded in-flight requests, deadlines,
-ping/pong keepalives, and transaction hash verification.
+ping/pong keepalives, and transaction hash verification. The driver reconnects
+in the background without replaying transactions.
 
 ## Usage
 
@@ -42,15 +43,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `cloud` uses `wss://api.blxrbdn.com/ws`. Construction performs no network I/O;
-`send_raw_tx` connects automatically when needed. Keep the client alive and
-reuse it for subsequent submissions. Share it with `Arc<BloxrouteClient>`
-when submitting from multiple tasks.
+`connect` starts the driver on the current Tokio runtime and waits for a ready
+connection. `send_raw_tx` does this automatically when needed. Keep the client
+alive and reuse it for subsequent submissions. Share it with
+`Arc<BloxrouteClient>` when submitting from multiple tasks.
 
 The caller supplies the complete signed transaction encoding as bytes. The
 client hex-encodes those bytes for the API; it does not sign transactions or
 check their chain ID. A successful result is the acknowledged
 `alloy_primitives::B256` hash, verified against the submitted bytes. Track
 inclusion and execution separately using your chain RPC provider.
+
+## Immediate submission
+
+For latency-sensitive callers, warm the connection before submitting and use
+`try_submit`. It synchronously encodes and enqueues the request, returning a
+`Submission` handle. The driver can write before `try_submit` returns; sending
+does not depend on calling or polling `Submission::wait`.
+
+```rust,no_run
+use alloy_primitives::keccak256;
+use bloxroute_rs::{BloxrouteClient, BloxrouteNetwork};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = BloxrouteClient::cloud(
+        BloxrouteNetwork::Base,
+        std::env::var("BLXR_AUTH")?,
+    );
+    client.connect().await?;
+
+    let signed_tx = std::fs::read("signed-tx.bin")?;
+    // Reuse the signer's hash when available; it must match these exact bytes.
+    let hash = keccak256(&signed_tx);
+
+    // Record the transaction locally before this call.
+    let submission = client.try_submit(&signed_tx, hash, None)?;
+
+    // Prepare other transactions while the driver sends this one.
+    // Keep the handle alive; collect its outcome when ready.
+    let outcome = submission.wait().await;
+    println!("transport timing: {:?}", outcome.timing);
+    outcome.result?;
+    Ok(())
+}
+```
+
+The supplied hash is trusted, avoiding another Keccak calculation. The API
+response is checked against that hash. `try_submit` never waits for connection
+readiness or capacity: `NotConnected` and `Full` are immediate, definitely-unsent
+results. Every error returned directly by `try_submit` means nothing was
+enqueued. Errors in the eventual outcome can indicate uncertain delivery.
+
+Use a multi-thread Tokio runtime if the submitting thread does synchronous
+CPU work, such as signing. The single socket driver can then progress
+independently; the client does not create its own runtime or spawn
+per-transaction tasks. On a current-thread runtime, synchronous work still
+delays the driver.
+
+`SubmissionOutcome` contains the local hash, acknowledgement result, and
+monotonic `std::time::Instant` timestamps for enqueueing, write start, write/flush
+completion, and response receipt. Unreached stages are `None`. Enqueueing is
+timestamped after JSON/hex encoding; measure the call externally to include
+encoding cost. Flush completion means completion at the underlying transport,
+not proof of NIC transmission or remote receipt. Timings remain available on
+errors, including acknowledgement timeouts.
+
+Keep each handle until its result is known. Dropping a handle (or its `wait`
+future) cancels a request only if its write has not started; after a write
+attempt, delivery remains uncertain. The driver enforces deadlines even when
+handles are not polled; `wait` also enforces the original deadline while the
+driver is occupied with another write.
 
 ## Supported networks
 
@@ -95,7 +158,7 @@ fn configured_client(auth: String) -> Result<BloxrouteClient, BloxrouteClientErr
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `connect_timeout` | 5 s | Connection setup and explicit connection warmup |
+| `connect_timeout` | 5 s | Each background handshake and explicit connection warmup |
 | `request_timeout` | 5 s | Whole submission, including queueing, connection setup, write, and acknowledgement |
 | `write_timeout` | 1 s | Each WebSocket write |
 | `ping_interval` | 15 s | Keepalive ping interval |
@@ -111,24 +174,28 @@ validation happens when connecting.
 
 ## Delivery and errors
 
-After a disconnect, a later submission establishes a new connection. If a
-write has been attempted and its acknowledgement is lost, the client returns
-`BloxrouteClientError::AcknowledgementUnknown` with the locally computed
-transaction hash. It never automatically replays that transaction.
+After a disconnect, the driver reconnects independently with a backoff starting
+at 100 ms and capped at 1 s. If `connect` times out, the driver continues
+reconnecting. Requests admitted against an older connection are rejected without
+being replayed on the new one, including producers that race with reconnection.
+Dropping the client stops its driver and resolves outstanding submissions.
+
+If a write has been attempted and its acknowledgement is lost, the client
+returns `BloxrouteClientError::AcknowledgementUnknown` with the local transaction
+hash. It never automatically replays that transaction.
 
 Use `error.may_have_been_submitted()` to identify uncertain delivery and
 reconcile the transaction hash before retrying or replacing it. An API
 acknowledgement confirms submission, without confirming on-chain inclusion.
 
 - `Timeout` means the deadline elapsed before a write attempt.
+- `NotConnected` means no ready connection was available for immediate admission.
+- `Full` means submission capacity was exhausted; nothing was enqueued.
 - `AcknowledgementUnknown` means delivery is uncertain after a write attempt,
   including a mismatched response hash.
 - `Rpc { code, message }` preserves a bloXroute API rejection.
 - `InvalidOptions`, `InvalidAuthHeader`, `RequestTooLarge`, and
   `UnsupportedRewardAddress` describe local configuration or input failures.
-
-Cancelling a submission before its write prevents a queued request from being
-sent. Cancelling after a write attempt leaves delivery uncertain.
 
 ## Runnable example
 
@@ -157,6 +224,16 @@ cargo package --locked
 Normal tests use local mock WebSocket servers. Live checks are ignored by
 default and require `BLXR_AUTH`. The README also serves as the crate's Rustdoc
 overview, so its Rust examples are compiled by `cargo test`.
+
+A separate ignored loopback benchmark reports admission and write latency with
+an idle submitting thread and with 200 µs of synchronous work after admission:
+
+```sh
+cargo test --release --locked local_submission_latency_under_cpu_load -- --ignored --nocapture
+```
+
+This benchmark uses a local mock server and submits no live transactions. Its
+numbers measure the client path, not production TLS, network, or sequencer latency.
 
 ## License
 
